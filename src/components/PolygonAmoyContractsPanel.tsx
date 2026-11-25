@@ -269,7 +269,7 @@ export const PolygonAmoyContractsPanel: React.FC<Props> = ({ parcels, onParcelMi
             </a>
           ) : (
             <p className="text-[11px] text-slate-400">
-              Run <code className="font-mono text-slate-200">cd contracts &amp;&amp; npm run deploy:amoy</code> or deploy via Remix, then paste the address here.
+              Deploy <code className="font-mono text-slate-200">contracts/AnaguToken.sol</code> directly in Remix IDE on Polygon Amoy, then paste the address here.
             </p>
           )}
         </div>

@@ -1,40 +1,60 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity ^0.8.20;
 
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+interface IERC721Receiver {
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    ) external returns (bytes4);
+}
 
 /**
  * @title AnaguLandTitleNFT
- * @notice ERC-721 Land Title Registry for the ANAGU Land Administration Platform.
+ * @notice Standalone, zero-dependency ERC-721 Statutory Land Title Registry for
+ *         the ANAGU Land Administration Platform (Remix IDE ready — no Hardhat
+ *         or external imports).
  *
  * Core invariants:
- *  - One registered land parcel = one unique non-fungible title token (1:1 permanent mapping).
- *  - Zero personally identifiable information (PII) stored on-chain; off-chain documents,
- *    coordinates, and statutory records are anchored via cryptographic hashes and non-sensitive references.
- *  - Community/Oracle attestation (ORACLE_ROLE) is mandatory prior to title minting,
+ *  - 1 registered land parcel = 1 unique non-fungible title token (permanent 1:1 mapping).
+ *  - Zero PII stored on-chain; off-chain documents, coordinates, and statutory records
+ *    are anchored via cryptographic hashes and non-sensitive cadastral references.
+ *  - Community/Oracle attestation (ORACLE_ROLE) is mandatory before title minting,
  *    but attestation alone never grants ownership or authorizes minting.
- *  - Title issuance (mintTitle) and legal transfers (registryTransfer) are restricted to REGISTRAR_ROLE;
- *    ordinary peer-to-peer wallet transfers are blocked in _update().
- *  - Statutory revocation under Section 28 of the Land Use Act is restricted to GOVERNOR_ROLE;
- *    revoked titles are preserved on-chain (never burned), permanently non-transferable,
+ *  - Title issuance (`mintTitle`) and legal transfers (`registryTransfer`) are restricted
+ *    to `REGISTRAR_ROLE`; peer-to-peer wallet transfers and approvals are blocked.
+ *  - Section 28 statutory revocation (`revokeTitle`) is restricted to `GOVERNOR_ROLE`;
+ *    revoked titles remain on-chain (never burned), are permanently non-transferable,
  *    and their parcel IDs can never be re-minted.
  */
-contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
+contract AnaguLandTitleNFT {
     // -------------------------------------------------------------------------
-    // Roles (Least Privilege)
+    // ERC-721 Metadata
     // -------------------------------------------------------------------------
 
-    /// @notice Authorized Land Registrar: mints attested titles and executes approved registry transfers.
+    string public constant name = "ANAGU Land Title NFT";
+    string public constant symbol = "ANAGU-TITLE";
+    string private _baseTokenURI;
+
+    // -------------------------------------------------------------------------
+    // Roles (Least Privilege, Standalone)
+    // -------------------------------------------------------------------------
+
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
     bytes32 public constant REGISTRAR_ROLE = keccak256("REGISTRAR_ROLE");
-
-    /// @notice Authorized Community / Verification Oracle: records pre-mint parcel attestations.
     bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
-
-    /// @notice Authorized State Governor / Statutory Authority: records Section 28 revocations.
     bytes32 public constant GOVERNOR_ROLE = keccak256("GOVERNOR_ROLE");
+
+    mapping(bytes32 => mapping(address => bool)) private _roles;
+
+    // -------------------------------------------------------------------------
+    // Reentrancy Guard (Standalone)
+    // -------------------------------------------------------------------------
+
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _reentrancyStatus = _NOT_ENTERED;
 
     // -------------------------------------------------------------------------
     // Types
@@ -50,7 +70,6 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
         BreachOfStatutoryCondition
     }
 
-    /// @notice Immutable title issuance record written once at mint time.
     struct TitleIssuanceRecord {
         bytes32 parcelIdHash;
         string cadastralRef;
@@ -62,7 +81,6 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
         address initialOwner;
     }
 
-    /// @notice Mutable title lifecycle state separate from immutable issuance metadata.
     struct TitleState {
         TitleStatus status;
         uint32 transferCount;
@@ -70,7 +88,6 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
         uint64 lastTransferredAt;
     }
 
-    /// @notice Pre-mint community/oracle attestation record anchored by parcel ID hash.
     struct OracleAttestationRecord {
         bytes32 attestationHash;
         uint64 attestedAt;
@@ -78,7 +95,6 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
         bool exists;
     }
 
-    /// @notice Append-only audit entry for each registry-approved title transfer.
     struct TransferRecord {
         address from;
         address to;
@@ -87,7 +103,6 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
         address executedBy;
     }
 
-    /// @notice Permanent audit record for a Section 28 statutory revocation.
     struct RevocationRecord {
         bool revoked;
         RevocationGround ground;
@@ -102,8 +117,11 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
     // Custom Errors
     // -------------------------------------------------------------------------
 
+    error UnauthorizedRole(address account, bytes32 role);
+    error ReentrancyDetected();
     error ZeroAddress();
     error InvalidRecipient(address recipient);
+    error ERC721InvalidReceiver(address receiver);
     error InvalidParcelId();
     error InvalidCadastralRef();
     error InvalidSpatialHash();
@@ -119,11 +137,17 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
     error TitleAlreadyRevoked(uint256 tokenId);
     error PeerToPeerTransferBlocked(uint256 tokenId);
     error TransferToSameOwner(uint256 tokenId, address owner);
-    error TitleBurningProhibited(uint256 tokenId);
 
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
+
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+    event BaseURIUpdated(string newBaseURI);
 
     event OracleAttested(
         bytes32 indexed parcelIdHash,
@@ -169,40 +193,56 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
     // State Variables
     // -------------------------------------------------------------------------
 
-    /// @dev Starts at 1 so tokenId == 0 unambiguously indicates an unregistered parcel.
     uint256 private _nextTokenId = 1;
 
-    /// @dev Guard flag allowing transfers in _update() ONLY during registryTransfer().
-    bool private _registryTransferInProgress;
+    mapping(uint256 => address) private _owners;
+    mapping(address => uint256) private _balances;
 
-    /// @dev Permanent 1:1 binding from canonical parcelIdHash to tokenId. Never deleted.
-    mapping(bytes32 parcelIdHash => uint256 tokenId) private _parcelToTokenId;
-
-    mapping(bytes32 parcelIdHash => OracleAttestationRecord) private _oracleAttestations;
-    mapping(uint256 tokenId => TitleIssuanceRecord) private _issuanceRecords;
-    mapping(uint256 tokenId => TitleState) private _titleStates;
-    mapping(uint256 tokenId => TransferRecord[]) private _transferHistory;
-    mapping(uint256 tokenId => RevocationRecord) private _revocationRecords;
+    mapping(bytes32 => uint256) private _parcelToTokenId;
+    mapping(bytes32 => OracleAttestationRecord) private _oracleAttestations;
+    mapping(uint256 => TitleIssuanceRecord) private _issuanceRecords;
+    mapping(uint256 => TitleState) private _titleStates;
+    mapping(uint256 => TransferRecord[]) private _transferHistory;
+    mapping(uint256 => RevocationRecord) private _revocationRecords;
 
     // -------------------------------------------------------------------------
-    // Constructor
+    // Modifiers
+    // -------------------------------------------------------------------------
+
+    modifier onlyRole(bytes32 role) {
+        if (!_roles[role][msg.sender]) {
+            revert UnauthorizedRole(msg.sender, role);
+        }
+        _;
+    }
+
+    modifier nonReentrant() {
+        if (_reentrancyStatus == _ENTERED) {
+            revert ReentrancyDetected();
+        }
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
+
+    // -------------------------------------------------------------------------
+    // Constructor (Remix-Friendly)
     // -------------------------------------------------------------------------
 
     /**
-     * @param initialAdmin Required address receiving DEFAULT_ADMIN_ROLE (role administration only).
-     * @param initialRegistrar Optional initial REGISTRAR_ROLE address (pass address(0) to assign later).
-     * @param initialOracle Optional initial ORACLE_ROLE address (pass address(0) to assign later).
-     * @param initialGovernor Optional initial GOVERNOR_ROLE address (pass address(0) to assign later).
+     * @param initialAdmin     Receives DEFAULT_ADMIN_ROLE. Pass address(0) to default to msg.sender.
+     * @param initialRegistrar Receives REGISTRAR_ROLE (pass address(0) to assign later via grantRole).
+     * @param initialOracle    Receives ORACLE_ROLE (pass address(0) to assign later via grantRole).
+     * @param initialGovernor  Receives GOVERNOR_ROLE (pass address(0) to assign later via grantRole).
      */
     constructor(
         address initialAdmin,
         address initialRegistrar,
         address initialOracle,
         address initialGovernor
-    ) ERC721("ANAGU Land Title NFT", "ANAGU-TITLE") {
-        if (initialAdmin == address(0)) revert ZeroAddress();
-
-        _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
+    ) {
+        address admin = initialAdmin == address(0) ? msg.sender : initialAdmin;
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
 
         if (initialRegistrar != address(0)) {
             _grantRole(REGISTRAR_ROLE, initialRegistrar);
@@ -216,14 +256,107 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
     }
 
     // -------------------------------------------------------------------------
-    // External State-Changing Functions
+    // Access Control Functions
+    // -------------------------------------------------------------------------
+
+    function hasRole(bytes32 role, address account) public view returns (bool) {
+        return _roles[role][account];
+    }
+
+    function grantRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (account == address(0)) revert ZeroAddress();
+        _grantRole(role, account);
+    }
+
+    function revokeRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_roles[role][account]) {
+            _roles[role][account] = false;
+            emit RoleRevoked(role, account, msg.sender);
+        }
+    }
+
+    function renounceRole(bytes32 role) external {
+        if (_roles[role][msg.sender]) {
+            _roles[role][msg.sender] = false;
+            emit RoleRevoked(role, msg.sender, msg.sender);
+        }
+    }
+
+    function setBaseURI(string calldata newBaseURI) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _baseTokenURI = newBaseURI;
+        emit BaseURIUpdated(newBaseURI);
+    }
+
+    function _grantRole(bytes32 role, address account) internal {
+        if (!_roles[role][account]) {
+            _roles[role][account] = true;
+            emit RoleGranted(role, account, msg.sender);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Standard ERC-721 Read & P2P-Locked Transfer Interface
+    // -------------------------------------------------------------------------
+
+    function balanceOf(address owner) external view returns (uint256) {
+        if (owner == address(0)) revert ZeroAddress();
+        return _balances[owner];
+    }
+
+    function ownerOf(uint256 tokenId) public view returns (address) {
+        address owner = _owners[tokenId];
+        if (owner == address(0)) revert TitleDoesNotExist(tokenId);
+        return owner;
+    }
+
+    function tokenURI(uint256 tokenId) external view returns (string memory) {
+        if (_owners[tokenId] == address(0)) revert TitleDoesNotExist(tokenId);
+        if (bytes(_baseTokenURI).length == 0) return "";
+        return string(abi.encodePacked(_baseTokenURI, _toString(tokenId)));
+    }
+
+    function getApproved(uint256 tokenId) external view returns (address) {
+        if (_owners[tokenId] == address(0)) revert TitleDoesNotExist(tokenId);
+        return address(0);
+    }
+
+    function isApprovedForAll(address, address) external pure returns (bool) {
+        return false;
+    }
+
+    function approve(address, uint256 tokenId) external pure {
+        revert PeerToPeerTransferBlocked(tokenId);
+    }
+
+    function setApprovalForAll(address, bool) external pure {
+        revert PeerToPeerTransferBlocked(0);
+    }
+
+    function transferFrom(address, address, uint256 tokenId) external pure {
+        revert PeerToPeerTransferBlocked(tokenId);
+    }
+
+    function safeTransferFrom(address, address, uint256 tokenId) external pure {
+        revert PeerToPeerTransferBlocked(tokenId);
+    }
+
+    function safeTransferFrom(address, address, uint256 tokenId, bytes calldata) external pure {
+        revert PeerToPeerTransferBlocked(tokenId);
+    }
+
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return
+            interfaceId == 0x01ffc9a5 || // ERC-165
+            interfaceId == 0x80ac58cd || // ERC-721
+            interfaceId == 0x5b5e139f;   // ERC-721 Metadata
+    }
+
+    // -------------------------------------------------------------------------
+    // Statutory Land Registry State-Changing Functions
     // -------------------------------------------------------------------------
 
     /**
-     * @notice Records a Community / Verification Oracle attestation for a parcel prior to minting.
-     * @dev Restricted to ORACLE_ROLE. Attestation alone never grants legal ownership or authorizes minting.
-     * @param parcelId Canonical ANAGU parcel identifier (e.g. "PAR-2026-0001").
-     * @param attestationHash Non-zero cryptographic hash of the off-chain oracle attestation record.
+     * @notice Records a Community / Verification Oracle attestation prior to minting.
      */
     function recordOracleAttestation(
         string calldata parcelId,
@@ -252,15 +385,7 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
     }
 
     /**
-     * @notice Mints a unique ERC-721 Land Title NFT for an oracle-attested land parcel.
-     * @dev Restricted to REGISTRAR_ROLE. Protected by nonReentrant due to _safeMint ERC721Receiver callback.
-     *      Stores only hashes and non-sensitive cadastral references on-chain (no PII).
-     * @param to Initial registered titleholder wallet address (must be non-zero).
-     * @param parcelId Canonical ANAGU parcel identifier (hashed permanently to enforce 1 parcel = 1 NFT).
-     * @param cadastralRef Non-sensitive official cadastral survey reference.
-     * @param spatialHash Keccak-256 hash of verified PostGIS parcel geometry.
-     * @param documentHash Cryptographic hash (e.g. SHA-256) of off-chain title deed package.
-     * @return tokenId Newly minted unique token ID.
+     * @notice Mints a unique ERC-721 Land Title NFT for an oracle-attested parcel.
      */
     function mintTitle(
         address to,
@@ -295,8 +420,11 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
 
         uint64 issuedAt = uint64(block.timestamp);
 
-        // Effects before external _safeMint callback (Checks-Effects-Interactions)
         _parcelToTokenId[parcelIdHash] = tokenId;
+        _owners[tokenId] = to;
+        unchecked {
+            _balances[to] += 1;
+        }
 
         _issuanceRecords[tokenId] = TitleIssuanceRecord({
             parcelIdHash: parcelIdHash,
@@ -316,6 +444,7 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
             lastTransferredAt: 0
         });
 
+        emit Transfer(address(0), to, tokenId);
         emit TitleMinted(
             tokenId,
             parcelIdHash,
@@ -328,23 +457,18 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
             msg.sender
         );
 
-        _safeMint(to, tokenId);
+        _checkOnERC721Received(msg.sender, address(0), to, tokenId, "");
     }
 
     /**
-     * @notice Executes an authorized registry-controlled transfer of an active land title.
-     * @dev Restricted to REGISTRAR_ROLE. Protected by nonReentrant. Resets _registryTransferInProgress
-     *      BEFORE invoking ERC721Receiver callback so malicious recipients cannot piggyback P2P transfers.
-     * @param tokenId Existing active title token ID.
-     * @param to New registered titleholder address (non-zero, different from current owner).
-     * @param instrumentHash Non-zero hash of the off-chain registered transfer/conveyance instrument.
+     * @notice Executes an authorized Registrar-controlled transfer of an active land title.
      */
     function registryTransfer(
         uint256 tokenId,
         address to,
         bytes32 instrumentHash
     ) external onlyRole(REGISTRAR_ROLE) nonReentrant {
-        address from = _ownerOf(tokenId);
+        address from = _owners[tokenId];
         if (from == address(0)) revert TitleDoesNotExist(tokenId);
         if (_titleStates[tokenId].status == TitleStatus.Revoked) revert TitleAlreadyRevoked(tokenId);
         if (to == address(0)) revert InvalidRecipient(to);
@@ -367,10 +491,13 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
             })
         );
 
-        _registryTransferInProgress = true;
-        _transfer(from, to, tokenId);
-        _registryTransferInProgress = false;
+        unchecked {
+            _balances[from] -= 1;
+            _balances[to] += 1;
+        }
+        _owners[tokenId] = to;
 
+        emit Transfer(from, to, tokenId);
         emit RegistryTransferExecuted(
             tokenId,
             _issuanceRecords[tokenId].parcelIdHash,
@@ -381,19 +508,11 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
             msg.sender
         );
 
-        // Safe ERC721Receiver callback runs AFTER flag reset and state updates.
-        _checkOnERC721Received(_msgSender(), from, to, tokenId, "");
+        _checkOnERC721Received(msg.sender, from, to, tokenId, "");
     }
 
     /**
-     * @notice Records a statutory revocation (Land Use Act Section 28) on-chain.
-     * @dev Restricted to GOVERNOR_ROLE. Never burns the token or erases historical ownership.
-     *      On-chain revocation records the outcome of the statutory legal process and does not
-     *      substitute for legally required statutory notice, gazetting, and due process.
-     * @param tokenId Existing active title token ID.
-     * @param ground Statutory revocation ground (OverridingPublicInterest or BreachOfStatutoryCondition).
-     * @param gazetteNumber Official government gazette reference number.
-     * @param reasonHash Cryptographic hash of the off-chain statutory revocation instrument/reason.
+     * @notice Records a Section 28 statutory revocation on-chain without burning the title.
      */
     function revokeTitle(
         uint256 tokenId,
@@ -401,7 +520,7 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
         string calldata gazetteNumber,
         bytes32 reasonHash
     ) external onlyRole(GOVERNOR_ROLE) {
-        address currentOwner = _ownerOf(tokenId);
+        address currentOwner = _owners[tokenId];
         if (currentOwner == address(0)) revert TitleDoesNotExist(tokenId);
         if (_titleStates[tokenId].status == TitleStatus.Revoked) revert TitleAlreadyRevoked(tokenId);
         if (bytes(gazetteNumber).length == 0) revert InvalidGazetteNumber();
@@ -436,107 +555,61 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
     // View / Query Functions
     // -------------------------------------------------------------------------
 
-    /// @notice Computes the canonical bytes32 parcel ID hash from an ANAGU parcel identifier string.
     function computeParcelIdHash(string calldata parcelId) public pure returns (bytes32) {
         if (bytes(parcelId).length == 0) revert InvalidParcelId();
         return keccak256(abi.encodePacked(parcelId));
     }
 
-    /// @notice Returns the token ID bound to a parcel ID string (0 if unregistered).
     function getTokenIdByParcelId(string calldata parcelId) external view returns (uint256) {
         return _parcelToTokenId[computeParcelIdHash(parcelId)];
     }
 
-    /// @notice Returns the token ID bound to a parcel ID hash (0 if unregistered).
     function getTokenIdByParcelHash(bytes32 parcelIdHash) external view returns (uint256) {
         return _parcelToTokenId[parcelIdHash];
     }
 
-    /// @notice Returns true if a parcel ID has ever been registered (including if subsequently revoked).
     function isParcelRegistered(string calldata parcelId) external view returns (bool) {
         return _parcelToTokenId[computeParcelIdHash(parcelId)] != 0;
     }
 
-    /// @notice Returns the recorded oracle attestation for a parcel ID.
     function getOracleAttestation(
         string calldata parcelId
     ) external view returns (OracleAttestationRecord memory) {
         return _oracleAttestations[computeParcelIdHash(parcelId)];
     }
 
-    /// @notice Returns the immutable issuance record for an existing token ID.
     function getTitleIssuance(uint256 tokenId) external view returns (TitleIssuanceRecord memory) {
-        if (_ownerOf(tokenId) == address(0)) revert TitleDoesNotExist(tokenId);
+        if (_owners[tokenId] == address(0)) revert TitleDoesNotExist(tokenId);
         return _issuanceRecords[tokenId];
     }
 
-    /// @notice Returns the mutable lifecycle state for an existing token ID.
     function getTitleState(uint256 tokenId) external view returns (TitleState memory) {
-        if (_ownerOf(tokenId) == address(0)) revert TitleDoesNotExist(tokenId);
+        if (_owners[tokenId] == address(0)) revert TitleDoesNotExist(tokenId);
         return _titleStates[tokenId];
     }
 
-    /// @notice Returns the statutory revocation record for an existing token ID.
     function getRevocationRecord(uint256 tokenId) external view returns (RevocationRecord memory) {
-        if (_ownerOf(tokenId) == address(0)) revert TitleDoesNotExist(tokenId);
+        if (_owners[tokenId] == address(0)) revert TitleDoesNotExist(tokenId);
         return _revocationRecords[tokenId];
     }
 
-    /// @notice Returns the complete registry transfer history for an existing token ID.
     function getTransferHistory(uint256 tokenId) external view returns (TransferRecord[] memory) {
-        if (_ownerOf(tokenId) == address(0)) revert TitleDoesNotExist(tokenId);
+        if (_owners[tokenId] == address(0)) revert TitleDoesNotExist(tokenId);
         return _transferHistory[tokenId];
     }
 
-    /// @notice Returns true if an existing title has been statutorily revoked.
     function isTitleRevoked(uint256 tokenId) external view returns (bool) {
-        if (_ownerOf(tokenId) == address(0)) revert TitleDoesNotExist(tokenId);
+        if (_owners[tokenId] == address(0)) revert TitleDoesNotExist(tokenId);
         return _titleStates[tokenId].status == TitleStatus.Revoked;
     }
 
-    /// @notice Returns the total number of titles ever minted (including revoked titles).
     function totalMintedTitles() external view returns (uint256) {
         return _nextTokenId - 1;
     }
 
     // -------------------------------------------------------------------------
-    // Internal ERC-721 Transfer Guard (OpenZeppelin v5 _update hook)
+    // Internal Helpers
     // -------------------------------------------------------------------------
-
-    /**
-     * @dev Enforces registry-controlled transfers across all ERC-721 transfer entry points
-     *      (transferFrom, safeTransferFrom, approved operators).
-     *      - Minting (from == address(0)) is permitted only through mintTitle().
-     *      - Burning (to == address(0)) is prohibited to preserve statutory audit history.
-     *      - Revoked titles can never be transferred.
-     *      - Any transfer outside registryTransfer() reverts with PeerToPeerTransferBlocked.
-     */
-    function _update(
-        address to,
-        uint256 tokenId,
-        address auth
-    ) internal override returns (address) {
-        address from = _ownerOf(tokenId);
-
-        if (from == address(0)) {
-            if (to == address(0)) revert InvalidRecipient(to);
-            return super._update(to, tokenId, auth);
-        }
-
-        if (to == address(0)) {
-            revert TitleBurningProhibited(tokenId);
-        }
-
-        if (_titleStates[tokenId].status == TitleStatus.Revoked) {
-            revert TitleAlreadyRevoked(tokenId);
-        }
-
-        if (!_registryTransferInProgress) {
-            revert PeerToPeerTransferBlocked(tokenId);
-        }
-
-        return super._update(to, tokenId, auth);
-    }
 
     function _checkOnERC721Received(
         address operator,
@@ -564,13 +637,20 @@ contract AnaguLandTitleNFT is ERC721, AccessControl, ReentrancyGuard {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // ERC-165 Interface Support
-    // -------------------------------------------------------------------------
-
-    function supportsInterface(
-        bytes4 interfaceId
-    ) public view override(ERC721, AccessControl) returns (bool) {
-        return super.supportsInterface(interfaceId);
+    function _toString(uint256 value) private pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
     }
 }
