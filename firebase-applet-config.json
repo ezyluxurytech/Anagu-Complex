@@ -1,0 +1,12 @@
+{
+  "projectId": "anagu-land-registry",
+  "appId": "1:291028903:web:38dea94f9ee0e215098082",
+  "apiKey": "AIzaSyDnTvCpdAOAO1yhebl4PbUFB5JrvJ7-ZhQ",
+  "authDomain": "anagu-land-registry.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-anagu-a03f2da9-5336-4618-b45d-59b372051ff4",
+  "storageBucket": "anagu-land-registry.firebasestorage.app",
+  "messagingSenderId": "291028903",
+  "measurementId": "",
+  "oAuthClientId": "291028903-92hbb0d1ov03ljsobk84bfu1vcc5v8dk.apps.googleusercontent.com",
+  "recaptchaSiteKey": ""
+}

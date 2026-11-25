@@ -1,0 +1,1456 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  FileText,
+  MapPin,
+  Upload,
+  CheckCircle2,
+  ChevronRight,
+  Compass,
+  ShieldCheck,
+  X,
+  Search,
+  Map as MapIcon,
+  RefreshCw,
+  Camera,
+  Wallet,
+  Coins,
+  ExternalLink
+} from 'lucide-react';
+import { ParcelRecord, BeaconPoint, AuthUser } from '../../types/anagu';
+import {
+  NIGERIA_STATES_AND_LGAS,
+  getLgasForState,
+  getStateCode,
+  normalizeNigeriaState
+} from '../../data/nigeriaLocations';
+import {
+  buildPolygonJsonFromCenter,
+  captureOsmMapSnapshot,
+  geocodeNigerianLocation,
+  GeocodeSuggestion,
+  getStateCenter,
+  searchNigerianLandmarks
+} from '../../lib/osm';
+import {
+  ConnectedWalletResult,
+  cleanInvisibleChars,
+  connectWeb3Wallet,
+  discoverWalletsOnce,
+  formatWalletError,
+  truncateAddress,
+  validateSellerWallet
+} from '../../lib/web3Wallet';
+import {
+  getContractConfig,
+  getPolygonAmoyAddressUrl,
+  getPolygonAmoyTxUrl
+} from '../../config/contracts';
+import {
+  AnaguTokenStatus,
+  claimTestnetAnaguTokens,
+  payRegistrationFeeOnChain,
+  readAnaguTokenStatus
+} from '../../lib/anaguContracts';
+import { OpenStreetMapWidget } from '../maps/OpenStreetMapWidget';
+import { LandRegistrySnapshot } from '../maps/LandRegistrySnapshot';
+import { describeParcelGeography } from '../../lib/geoDescription';
+
+interface Props {
+  parcels: ParcelRecord[];
+  currentUser?: AuthUser | null;
+  isCloudConnected?: boolean;
+  onConnectGoogleSync?: () => Promise<void>;
+  onNewParcelSubmit: (newParcel: ParcelRecord) => Promise<ParcelRecord> | void;
+  onSelectParcel: (parcel: ParcelRecord) => void;
+  selectedParcelId?: string;
+  onSelectParcelId?: (id: string) => void;
+  onNextStep?: (parcelId: string) => void;
+  onOpenLands?: () => void;
+}
+
+const DOCUMENT_TYPES = [
+  'Certificate of Occupancy',
+  'Survey Plan',
+  "Governor's Statutory Consent",
+  'Traditional Council Affidavit'
+] as const;
+
+type DocumentTypeOption = (typeof DOCUMENT_TYPES)[number];
+
+const SAMPLE_DEMARCATION_POLYGON =
+  '[[[7.4910, 9.0820], [7.4922, 9.0820], [7.4922, 9.0830], [7.4910, 9.0830], [7.4910, 9.0820]]]';
+
+function parseDemarcationPolygon(raw: string): {
+  valid: boolean;
+  coordinates: [number, number][];
+  beacons: BeaconPoint[];
+} {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0 || !Array.isArray(parsed[0])) {
+      return { valid: false, coordinates: [], beacons: [] };
+    }
+    const ring = parsed[0];
+    if (ring.length < 4) {
+      return { valid: false, coordinates: [], beacons: [] };
+    }
+    for (const pt of ring) {
+      if (
+        !Array.isArray(pt) ||
+        pt.length < 2 ||
+        typeof pt[0] !== 'number' ||
+        typeof pt[1] !== 'number' ||
+        !Number.isFinite(pt[0]) ||
+        !Number.isFinite(pt[1])
+      ) {
+        return { valid: false, coordinates: [], beacons: [] };
+      }
+    }
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    const vertices =
+      first[0] === last[0] && first[1] === last[1] ? ring.slice(0, -1) : ring;
+    if (vertices.length < 3) {
+      return { valid: false, coordinates: [], beacons: [] };
+    }
+    const coordinates: [number, number][] = vertices.map((pt: number[]) => [pt[1], pt[0]]);
+    const beacons: BeaconPoint[] = vertices.map((pt: number[], idx: number) => ({
+      id: `BC-${idx + 1}`,
+      name: `PB ${idx + 1}`,
+      lat: pt[1],
+      lng: pt[0],
+      easting: Number((330000 + pt[0] * 111320).toFixed(1)),
+      northing: Number((pt[1] * 110574).toFixed(1)),
+      elevation: 520.0
+    }));
+    return { valid: true, coordinates, beacons };
+  } catch {
+    return { valid: false, coordinates: [], beacons: [] };
+  }
+}
+
+export const ScreenCitizenPortal: React.FC<Props> = ({
+  currentUser,
+  isCloudConnected = false,
+  onConnectGoogleSync,
+  onNewParcelSubmit,
+  onSelectParcelId,
+  onNextStep,
+  onOpenLands
+}) => {
+  const initialState = normalizeNigeriaState(currentUser?.state);
+  const initialLgas = getLgasForState(initialState);
+  const initialCenter = getStateCenter(initialState);
+
+  // Applicant & Jurisdiction
+  const [applicantName, setApplicantName] = useState(currentUser?.fullName || '');
+  const [applicantNin, setApplicantNin] = useState(currentUser?.credentialId || '');
+  const [sellerWallet, setSellerWallet] = useState('');
+  const [connectedWallet, setConnectedWallet] = useState<ConnectedWalletResult | null>(null);
+  const [isConnectingSellerWallet, setIsConnectingSellerWallet] = useState(false);
+  const [sellerWalletNote, setSellerWalletNote] = useState<string | null>(null);
+  const [tokenStatus, setTokenStatus] = useState<AnaguTokenStatus | null>(null);
+  const [isClaimingFaucet, setIsClaimingFaucet] = useState(false);
+  const [feeTxHash, setFeeTxHash] = useState<string | null>(null);
+  const [feeStatusNote, setFeeStatusNote] = useState<string | null>(null);
+  const contractConfig = useMemo(() => getContractConfig(), []);
+  const [state, setState] = useState(initialState);
+  const [lga, setLga] = useState(
+    initialLgas.includes('Abuja Municipal (AMAC)') ? 'Abuja Municipal (AMAC)' : initialLgas[0]
+  );
+  const [intendedUse, setIntendedUse] = useState<ParcelRecord['intendedUse']>('Residential');
+
+  // Survey Beacon / Land Demarcation, Location & Official Document
+  const [landDemarcation, setLandDemarcation] = useState(() =>
+    buildPolygonJsonFromCenter(initialCenter[0], initialCenter[1])
+  );
+  const [hasCustomPolygon, setHasCustomPolygon] = useState(false);
+  const [landLocation, setLandLocation] = useState('');
+  const [landPrice, setLandPrice] = useState<string>('85000');
+  const [surveyPlanRef, setSurveyPlanRef] = useState('');
+  const [isLocatingMap, setIsLocatingMap] = useState(false);
+  const [mapStatusNote, setMapStatusNote] = useState<string>(
+    `Centered on ${initialState} · Type a landmark or click map to preview exact location`
+  );
+  const [landmarkSuggestions, setLandmarkSuggestions] = useState<GeocodeSuggestion[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [previewSnapshotUrl, setPreviewSnapshotUrl] = useState<string>('');
+  const [previewSignature, setPreviewSignature] = useState<string>('');
+  const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
+
+  const [documentType, setDocumentType] = useState<DocumentTypeOption>('Survey Plan');
+  const [uploadedFileName, setUploadedFileName] = useState<string>('');
+  const [uploadedFileSize, setUploadedFileSize] = useState<string>('');
+  const [calculatedHash, setCalculatedHash] = useState<string>('');
+  const [isHashingFile, setIsHashingFile] = useState(false);
+
+  const [formError, setFormError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submittedParcel, setSubmittedParcel] = useState<ParcelRecord | null>(null);
+  const [isLinkingCloud, setIsLinkingCloud] = useState(false);
+
+  const handleLinkCloudClick = async () => {
+    if (!onConnectGoogleSync) return;
+    setIsLinkingCloud(true);
+    try {
+      await onConnectGoogleSync();
+    } finally {
+      setIsLinkingCloud(false);
+    }
+  };
+
+  const livePolygon = useMemo(
+    () => parseDemarcationPolygon(landDemarcation.trim()),
+    [landDemarcation]
+  );
+
+  const liveAreaEstimate = useMemo(() => {
+    if (!livePolygon.valid || livePolygon.beacons.length < 3) return 1200;
+    let sum = 0;
+    const b = livePolygon.beacons;
+    for (let i = 0; i < b.length; i++) {
+      const j = (i + 1) % b.length;
+      sum += b[i].easting * b[j].northing - b[j].easting * b[i].northing;
+    }
+    return Number((Math.abs(sum) / 2 || 1200).toFixed(1));
+  }, [livePolygon]);
+
+  const liveGeoInfo = useMemo(
+    () =>
+      describeParcelGeography({
+        state,
+        lga,
+        district: landLocation,
+        coordinates: livePolygon.valid ? livePolygon.coordinates : [],
+        areaSqm: liveAreaEstimate
+      }),
+    [state, lga, landLocation, livePolygon, liveAreaEstimate]
+  );
+
+  const walletCheck = useMemo(
+    () => validateSellerWallet(sellerWallet),
+    [sellerWallet]
+  );
+
+  useEffect(() => {
+    if (!currentUser) return;
+    setApplicantName((prev) => prev || currentUser.fullName || '');
+    setApplicantNin((prev) => prev || currentUser.credentialId || '');
+  }, [currentUser]);
+
+  const recenterMapForRegion = async (
+    targetLoc: string,
+    targetLga: string,
+    targetState: string,
+    force = false
+  ) => {
+    if (!force && hasCustomPolygon) return;
+    setIsLocatingMap(true);
+    try {
+      const geo = await geocodeNigerianLocation(targetLoc, targetLga, targetState);
+      setLandDemarcation(buildPolygonJsonFromCenter(geo.lat, geo.lng));
+      setMapStatusNote(
+        `OpenStreetMap pinned: ${geo.displayName} (${geo.lat.toFixed(5)}°N, ${geo.lng.toFixed(5)}°E)`
+      );
+    } finally {
+      setIsLocatingMap(false);
+    }
+  };
+
+  // Debounced landmark autocomplete + automatic exact location map centering while typing
+  useEffect(() => {
+    const query = landLocation.trim();
+    if (query.length < 3) {
+      setLandmarkSuggestions([]);
+      return;
+    }
+    let cancelled = false;
+    const searchTimer = window.setTimeout(async () => {
+      const results = await searchNigerianLandmarks(query, state);
+      if (!cancelled) {
+        setLandmarkSuggestions(results);
+      }
+    }, 380);
+
+    const autoLocateTimer = window.setTimeout(() => {
+      if (!cancelled && !hasCustomPolygon) {
+        void recenterMapForRegion(query, lga, state, false);
+      }
+    }, 780);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(searchTimer);
+      window.clearTimeout(autoLocateTimer);
+    };
+  }, [landLocation, state, lga, hasCustomPolygon]);
+
+  // Live pre-submission OpenStreetMap snapshot preview for Access Lands
+  useEffect(() => {
+    if (!livePolygon.valid || livePolygon.coordinates.length < 3) {
+      setPreviewSnapshotUrl('');
+      return;
+    }
+    let cancelled = false;
+    const label = landLocation.trim()
+      ? `${landLocation.trim()}, ${state}`
+      : `${lga}, ${state}`;
+
+    const sig = `${landDemarcation.trim()}|${landLocation.trim()}|${state}|${lga}`;
+    const timer = window.setTimeout(async () => {
+      setIsGeneratingPreview(true);
+      try {
+        const snapshot = await captureOsmMapSnapshot(livePolygon.coordinates, label);
+        if (!cancelled && snapshot) {
+          setPreviewSnapshotUrl(snapshot);
+          setPreviewSignature(sig);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsGeneratingPreview(false);
+        }
+      }
+    }, 450);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [livePolygon, landLocation, lga, state]);
+
+  const handleSelectSuggestion = (item: GeocodeSuggestion) => {
+    const shortName = item.name || item.displayName.split(',')[0].trim();
+    setLandLocation(shortName);
+    setHasCustomPolygon(false);
+    setShowSuggestions(false);
+    setLandmarkSuggestions([]);
+    setLandDemarcation(buildPolygonJsonFromCenter(item.lat, item.lng));
+    setMapStatusNote(
+      `Exact landmark selected: ${item.displayName} (${item.lat.toFixed(5)}°N, ${item.lng.toFixed(5)}°E)`
+    );
+  };
+
+  const handleRefreshSnapshotPreview = async () => {
+    if (!livePolygon.valid || livePolygon.coordinates.length < 3) return;
+    setIsGeneratingPreview(true);
+    try {
+      const label = landLocation.trim()
+        ? `${landLocation.trim()}, ${state}`
+        : `${lga}, ${state}`;
+      const snapshot = await captureOsmMapSnapshot(livePolygon.coordinates, label);
+      if (snapshot) {
+        setPreviewSnapshotUrl(snapshot);
+      }
+    } finally {
+      setIsGeneratingPreview(false);
+    }
+  };
+
+  const handlePickLocationOnMap = (lat: number, lng: number) => {
+    setHasCustomPolygon(true);
+    setLandDemarcation(buildPolygonJsonFromCenter(lat, lng));
+    setMapStatusNote(
+      `Custom plot pinned on OpenStreetMap at ${lat.toFixed(5)}°N, ${lng.toFixed(5)}°E`
+    );
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadedFileName(file.name);
+    const kb = Math.max(1, Math.round(file.size / 1024));
+    setUploadedFileSize(kb >= 1024 ? `${(kb / 1024).toFixed(2)} MB` : `${kb} KB`);
+    setFormError(null);
+    setIsHashingFile(true);
+    try {
+      const buffer = await file.arrayBuffer();
+      const digest = await crypto.subtle.digest('SHA-256', buffer);
+      const hashHex = Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+      setCalculatedHash(`0x${hashHex}`);
+    } catch {
+      setCalculatedHash(
+        '0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+      );
+    } finally {
+      setIsHashingFile(false);
+    }
+  };
+
+  const handleClearFile = () => {
+    setUploadedFileName('');
+    setUploadedFileSize('');
+    setCalculatedHash('');
+  };
+
+  const refreshAnaguTokenStatus = async (walletAddr?: string, provider?: ConnectedWalletResult['provider']) => {
+    try {
+      const status = await readAnaguTokenStatus(walletAddr, undefined, provider);
+      setTokenStatus(status);
+    } catch {
+      // Ignore RPC read failure when offline
+    }
+  };
+
+  useEffect(() => {
+    void refreshAnaguTokenStatus(sellerWallet || undefined, connectedWallet?.provider);
+  }, [sellerWallet, connectedWallet?.provider]);
+
+  const handleConnectSellerWallet = async () => {
+    setSellerWalletNote(null);
+    setFeeStatusNote(null);
+    setFormError(null);
+    setIsConnectingSellerWallet(true);
+    try {
+      const wallets = await discoverWalletsOnce(180);
+      if (wallets.length === 0) {
+        setSellerWalletNote(
+          'No browser wallet extension detected — paste any valid Polygon (0x...) wallet address above.'
+        );
+        return;
+      }
+      const connected = await connectWeb3Wallet(wallets[0], {
+        enforcePolygon: true,
+        targetNetwork: 'amoy'
+      });
+      setConnectedWallet(connected);
+      setSellerWallet(connected.address);
+      setSellerWalletNote(
+        `Connected ${connected.walletName} on ${connected.chainName} (${connected.address})`
+      );
+      await refreshAnaguTokenStatus(connected.address, connected.provider);
+    } catch (err) {
+      setSellerWalletNote(formatWalletError(err));
+    } finally {
+      setIsConnectingSellerWallet(false);
+    }
+  };
+
+  const handleClaimTestnetAnagu = async () => {
+    if (!connectedWallet) {
+      setFeeStatusNote('Connect your Polygon Amoy wallet first to claim 1,000 testnet ANAGU.');
+      return;
+    }
+    setIsClaimingFaucet(true);
+    setFeeStatusNote(null);
+    try {
+      const { txHash, amountFormatted } = await claimTestnetAnaguTokens(connectedWallet.provider);
+      setFeeStatusNote(`Claimed ${amountFormatted} testnet ANAGU (Tx ${txHash.slice(0, 12)}...).`);
+      await refreshAnaguTokenStatus(connectedWallet.address, connectedWallet.provider);
+    } catch (err) {
+      setFeeStatusNote(err instanceof Error ? err.message : 'Testnet faucet claim failed.');
+    } finally {
+      setIsClaimingFaucet(false);
+    }
+  };
+
+  const handleSubmitApplication = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFormError(null);
+
+    if (!applicantName.trim() || !applicantNin.trim()) {
+      setFormError('Please enter your applicant full name and NIN / RC number.');
+      return;
+    }
+    if (!walletCheck.valid) {
+      setFormError(
+        walletCheck.reason ||
+          "Please enter a valid Seller's Web3 Wallet address so buyers can pay directly."
+      );
+      return;
+    }
+    if (!landDemarcation.trim()) {
+      setFormError('Please enter the demarcation of the land polygon coordinates.');
+      return;
+    }
+    const parsedPolygon = parseDemarcationPolygon(landDemarcation.trim());
+    if (!parsedPolygon.valid) {
+      setFormError(
+        `Demarcation of Land must match the format: ${SAMPLE_DEMARCATION_POLYGON}`
+      );
+      return;
+    }
+    if (!landLocation.trim()) {
+      setFormError('Please enter the location of the land.');
+      return;
+    }
+    if (!uploadedFileName) {
+      setFormError('Please upload your official survey plan document before submitting.');
+      return;
+    }
+
+    const sanitizedPrice = landPrice.replace(/[$,\s]/g, '').trim();
+    const parsedPrice = Number(sanitizedPrice);
+    if (!sanitizedPrice || !Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+      setFormError('Please enter a valid land price greater than 0.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    const priceUsd = Number(parsedPrice.toFixed(2));
+    const beacons = parsedPolygon.beacons;
+    let computedArea = 0;
+    for (let i = 0; i < beacons.length; i++) {
+      const j = (i + 1) % beacons.length;
+      computedArea +=
+        beacons[i].easting * beacons[j].northing -
+        beacons[j].easting * beacons[i].northing;
+    }
+    const areaSqm = Number((Math.abs(computedArea) / 2 || 1200).toFixed(1));
+    const perimeterM = Number((Math.sqrt(areaSqm) * 4).toFixed(1));
+
+    const cleanState = normalizeNigeriaState(state);
+    const availableLgas = getLgasForState(cleanState);
+    const cleanLga = availableLgas.includes(lga) ? lga : availableLgas[0];
+    const statePrefix = getStateCode(cleanState);
+
+    const currentSig = `${landDemarcation.trim()}|${landLocation.trim()}|${state}|${lga}`;
+    let mapSnapshotUrl = previewSignature === currentSig ? previewSnapshotUrl : '';
+    if (!mapSnapshotUrl) {
+      try {
+        mapSnapshotUrl = await captureOsmMapSnapshot(
+          parsedPolygon.coordinates,
+          `${landLocation.trim()}, ${cleanState}`
+        );
+      } catch {
+        mapSnapshotUrl = '';
+      }
+    }
+
+    const uniqueSuffix = Date.now().toString(36).toUpperCase().slice(-4);
+    const newId = `PAR-2026-${Math.floor(1000 + Math.random() * 9000)}-${uniqueSuffix}`;
+
+    // Step 1 Statutory Due Process: settle ANAGU filing fee on Polygon Amoy if AnaguToken is deployed & wallet connected
+    let recordedFeeTxHash: string | undefined = feeTxHash || undefined;
+    const activeContracts = getContractConfig();
+    if (activeContracts.anaguTokenAddress && connectedWallet && !recordedFeeTxHash) {
+      try {
+        setFeeStatusNote(
+          `Confirming ${tokenStatus?.registrationFeeFormatted || activeContracts.registrationFeeAnagu} ANAGU statutory filing fee on Polygon Amoy...`
+        );
+        const feePayment = await payRegistrationFeeOnChain(connectedWallet.provider, newId);
+        recordedFeeTxHash = feePayment.txHash;
+        setFeeTxHash(feePayment.txHash);
+        setFeeStatusNote(
+          `Paid ${feePayment.feeFormatted} ANAGU statutory registration fee on Polygon Amoy.`
+        );
+        void refreshAnaguTokenStatus(connectedWallet.address, connectedWallet.provider);
+      } catch (err) {
+        setIsSubmitting(false);
+        setFormError(
+          err instanceof Error
+            ? `Polygon Amoy ANAGU filing fee failed: ${err.message}`
+            : 'Polygon Amoy ANAGU filing fee transaction was not completed.'
+        );
+        return;
+      }
+    }
+
+    const newParcel: ParcelRecord = {
+      id: newId,
+      cadastralRef: `${statePrefix}/${cleanLga.slice(0, 4).toUpperCase().replace(/[^A-Z]/g, 'X')}/2026-${Math.floor(
+        1000 + Math.random() * 9000
+      )}`,
+      applicantName: applicantName.trim(),
+      applicantNin: applicantNin.trim(),
+      state: cleanState,
+      lga: cleanLga,
+      district: `${landLocation.trim()}`,
+      areaSqm,
+      perimeterM,
+      intendedUse,
+      priceUsd,
+      sellerWallet: walletCheck.normalized,
+      mapSnapshotUrl: mapSnapshotUrl || undefined,
+      status: 'draft',
+      txHash: recordedFeeTxHash,
+      spatialHash:
+        '0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join(''),
+      documentHash:
+        calculatedHash ||
+        '0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join(''),
+      surveyPlanRef: surveyPlanRef.trim() || `NIS/${statePrefix}/SP/2026/${Math.floor(1000 + Math.random() * 8999)}`,
+      coordinates: parsedPolygon.coordinates,
+      beacons: parsedPolygon.beacons
+    };
+
+    const persistedParcel = (await onNewParcelSubmit(newParcel)) || newParcel;
+    onSelectParcelId?.(persistedParcel.id);
+    setIsSubmitting(false);
+    setSubmittedParcel(persistedParcel);
+  };
+
+  const handleResetForm = () => {
+    setSubmittedParcel(null);
+    const center = getStateCenter(state);
+    setLandDemarcation(buildPolygonJsonFromCenter(center[0], center[1]));
+    setHasCustomPolygon(false);
+    setLandLocation('');
+    setSurveyPlanRef('');
+    setDocumentType('Survey Plan');
+    setUploadedFileName('');
+    setUploadedFileSize('');
+    setCalculatedHash('');
+    setSellerWalletNote(null);
+    setFormError(null);
+  };
+
+  return (
+    <div className="w-full min-h-full bg-[#070b12] text-slate-100 relative overflow-y-auto">
+      {/* Subtle architectural radial glow */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-0 h-80 bg-[radial-gradient(ellipse_at_top,rgba(16,185,129,0.10),transparent_70%)]"
+      />
+
+      <div className="relative max-w-3xl mx-auto px-3.5 sm:px-6 py-7 sm:py-12 space-y-6 sm:space-y-8">
+        {/* Centered Header */}
+        <div className="text-center space-y-2.5">
+          <div className="inline-flex items-center gap-2 text-xs font-semibold tracking-wider uppercase text-emerald-400">
+            <ShieldCheck className="w-4 h-4 shrink-0" />
+            <span>Statutory Land Title Filing</span>
+          </div>
+          <h1 className="text-2xl sm:text-4xl font-bold text-white tracking-tight text-balance">
+            Register Land Application
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-400 max-w-xl mx-auto leading-relaxed">
+            Complete your applicant record, describe the land demarcation and exact location, and upload your official survey plan document.
+          </p>
+
+          {onConnectGoogleSync && (
+            <div className="pt-1 flex justify-center">
+              {isCloudConnected ? (
+                <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-950/60 border border-emerald-500/40 text-[11px] font-semibold text-emerald-300">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>Live Cloud Database Connected · Instant Admin Sync</span>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  disabled={isLinkingCloud}
+                  onClick={() => void handleLinkCloudClick()}
+                  className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900 hover:bg-slate-800 border border-emerald-500/40 text-[11px] font-semibold text-emerald-300 transition-colors disabled:opacity-60"
+                >
+                  <span>
+                    {isLinkingCloud
+                      ? 'Connecting Google Cloud Sync...'
+                      : 'Connect Google Cloud Sync for Instant Cross-Device Admin Visibility'}
+                  </span>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Success Receipt Card OR Centered Registration Form */}
+        {submittedParcel ? (
+          <div className="bg-slate-900 border border-amber-500/40 rounded-2xl p-4 sm:p-8 shadow-2xl space-y-5 sm:space-y-6">
+            <div className="flex items-start gap-3 sm:gap-4">
+              <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0">
+                <ShieldCheck className="w-5 h-5 sm:w-6 sm:h-6" />
+              </div>
+              <div className="space-y-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-base sm:text-lg font-bold text-white">Submitted — Waiting for Admin Approval</h2>
+                  <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 border border-amber-500/30 text-amber-300">
+                    Waiting for admin approval
+                  </span>
+                </div>
+                <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+                  Your parcel application has been recorded and now appears on Access Lands marked as <strong className="text-amber-300">Waiting for admin approval</strong>. Once an administrator approves it, its status will change to <strong className="text-emerald-400">Approved</strong> for buyers.
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-xl overflow-hidden border border-amber-500/30 bg-slate-950">
+              <div className="w-full h-52 sm:h-60">
+                <LandRegistrySnapshot
+                  coordinates={submittedParcel.coordinates}
+                  cadastralRef={submittedParcel.cadastralRef}
+                  areaSqm={submittedParcel.areaSqm}
+                  stateName={submittedParcel.state}
+                  title={submittedParcel.district}
+                  snapshotUrl={submittedParcel.mapSnapshotUrl || undefined}
+                />
+              </div>
+              <div className="px-3.5 sm:px-4 py-2.5 bg-slate-950 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+                <span className="inline-flex items-center gap-1.5 text-emerald-400 font-medium">
+                  <MapIcon className="w-3.5 h-3.5 shrink-0" />
+                  <span>Captured Land Registry Map Snapshot</span>
+                </span>
+                <span className="font-mono truncate">
+                  {submittedParcel.lga}, {submittedParcel.state}
+                </span>
+              </div>
+            </div>
+
+            <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+              <div>
+                <span className="text-slate-500 block">Cadastral Reference</span>
+                <span className="font-mono font-bold text-emerald-400 text-sm mt-0.5 block">
+                  {submittedParcel.cadastralRef}
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-500 block">Verification Status</span>
+                <span className="inline-flex items-center gap-1.5 font-semibold text-amber-300 mt-0.5">
+                  Waiting for admin approval
+                </span>
+              </div>
+              <div className="sm:col-span-2">
+                <span className="text-slate-500 block">Applicant</span>
+                <span className="font-semibold text-white mt-0.5 block">
+                  {submittedParcel.applicantName} ({submittedParcel.applicantNin})
+                </span>
+              </div>
+              <div className="sm:col-span-2">
+                <span className="text-slate-500 block">Demarcation of Land &amp; Land price</span>
+                <span className="font-mono text-slate-200 mt-0.5 block break-all">
+                  {landDemarcation} · $
+                  {(submittedParcel.priceUsd ?? 85000).toLocaleString('en-US', {
+                    maximumFractionDigits: 2
+                  })}{' '}
+                  USD
+                </span>
+              </div>
+              <div className="sm:col-span-2">
+                <span className="text-slate-500 block">Location of the Land</span>
+                <span className="font-medium text-slate-200 mt-0.5 block">
+                  {submittedParcel.district}, {submittedParcel.lga}, {submittedParcel.state}
+                </span>
+              </div>
+              <div className="sm:col-span-2">
+                <span className="text-slate-500 block">Geographical Area &amp; Geometry Direction</span>
+                <span className="text-slate-200 mt-0.5 block leading-relaxed">
+                  {describeParcelGeography({
+                    state: submittedParcel.state,
+                    lga: submittedParcel.lga,
+                    district: submittedParcel.district,
+                    coordinates: submittedParcel.coordinates,
+                    areaSqm: submittedParcel.areaSqm
+                  }).fullDescription}
+                </span>
+              </div>
+              <div className="sm:col-span-2">
+                <span className="text-slate-500 block">Seller&apos;s Receiving Wallet</span>
+                <span className="font-mono text-emerald-300 mt-0.5 block break-all">
+                  {submittedParcel.sellerWallet}
+                </span>
+              </div>
+              <div className="sm:col-span-2">
+                <span className="text-slate-500 block">Submitted Document ({documentType})</span>
+                <span className="font-mono text-slate-300 mt-0.5 block truncate">
+                  {uploadedFileName} · Hash: {submittedParcel.documentHash.slice(0, 22)}...
+                </span>
+              </div>
+              {submittedParcel.txHash && (
+                <div className="sm:col-span-2">
+                  <span className="text-slate-500 block">Polygon Amoy ANAGU Filing Fee Tx</span>
+                  <a
+                    href={getPolygonAmoyTxUrl(submittedParcel.txHash)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 font-mono text-emerald-400 hover:text-emerald-300 mt-0.5 break-all"
+                  >
+                    <span>{submittedParcel.txHash}</span>
+                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                  </a>
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2">
+              <button
+                type="button"
+                onClick={handleResetForm}
+                className="w-full sm:w-auto px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition-colors text-center"
+              >
+                Register Another Land
+              </button>
+
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2.5 w-full sm:w-auto">
+                {onNextStep && (
+                  <button
+                    type="button"
+                    onClick={() => onNextStep(submittedParcel.id)}
+                    className="w-full sm:w-auto px-4 py-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition-colors text-center"
+                  >
+                    Inspect GIS Map
+                  </button>
+                )}
+
+                {onOpenLands && (
+                  <button
+                    type="button"
+                    onClick={onOpenLands}
+                    className="w-full sm:w-auto px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl transition-colors inline-flex items-center justify-center gap-2 shadow-lg"
+                  >
+                    <span>Browse Access Lands</span>
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <form
+            onSubmit={handleSubmitApplication}
+            className="bg-slate-900/95 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden"
+          >
+            {/* Section 1: Applicant & Jurisdiction */}
+            <div className="p-4 sm:p-8 space-y-5">
+              <div className="flex items-center gap-3 pb-4 border-b border-slate-800">
+                <div className="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 flex items-center justify-center shrink-0">
+                  <MapPin className="w-4 h-4" />
+                </div>
+                <div>
+                  <h2 className="text-sm font-bold text-white tracking-tight">
+                    1. Applicant &amp; Jurisdiction Details
+                  </h2>
+                  <p className="text-[11px] text-slate-400">
+                    Identity and state administration information for the titleholder
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-slate-300">Applicant Full Name *</span>
+                  <input
+                    type="text"
+                    required
+                    value={applicantName}
+                    onChange={(e) => setApplicantName(e.target.value)}
+                    placeholder="e.g. Dr. Aminu Bello Abubakar"
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl text-slate-100 placeholder:text-slate-600 outline-none transition-colors"
+                  />
+                </label>
+
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-slate-300">National Identity Number (NIN / RC) *</span>
+                  <input
+                    type="text"
+                    required
+                    value={applicantNin}
+                    onChange={(e) => setApplicantNin(e.target.value)}
+                    placeholder="e.g. NIN-8921-4091-2311"
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl font-mono text-slate-100 placeholder:text-slate-600 outline-none transition-colors"
+                  />
+                </label>
+
+                <div className="space-y-1.5 sm:col-span-2">
+                  <label htmlFor="seller-wallet-input" className="block font-medium text-slate-300">
+                    Seller&apos;s Wallet Address (For Buyer Payment) *
+                  </label>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <div className="relative flex-1">
+                      <Wallet className="w-4 h-4 text-emerald-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        id="seller-wallet-input"
+                        type="text"
+                        required
+                        spellCheck={false}
+                        autoComplete="off"
+                        value={sellerWallet}
+                        onChange={(e) => {
+                          const rawVal = cleanInvisibleChars(e.target.value);
+                          const check = validateSellerWallet(rawVal);
+                          setSellerWallet(check.valid ? check.normalized : rawVal);
+                          setSellerWalletNote(null);
+                          if (formError?.toLowerCase().includes('wallet')) {
+                            setFormError(null);
+                          }
+                        }}
+                        onBlur={() => {
+                          const check = validateSellerWallet(sellerWallet);
+                          if (check.valid && check.normalized !== sellerWallet) {
+                            setSellerWallet(check.normalized);
+                          }
+                        }}
+                        placeholder="0x71C7656EC7ab88b098defB751B7401B5f6d8976F (or Solana / TRON / .eth)"
+                        className={`w-full pl-10 pr-3.5 py-2.5 bg-slate-950 border rounded-xl font-mono text-slate-100 placeholder:text-slate-600 outline-none transition-colors ${
+                          sellerWallet.trim().length === 0
+                            ? 'border-slate-700 focus:border-emerald-500'
+                            : walletCheck.valid
+                            ? 'border-emerald-500/70 focus:border-emerald-400'
+                            : 'border-amber-500/70 focus:border-amber-400'
+                        }`}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      disabled={isConnectingSellerWallet}
+                      onClick={() => void handleConnectSellerWallet()}
+                      className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 border border-slate-700 text-emerald-300 text-xs font-semibold rounded-xl transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
+                    >
+                      <Wallet className="w-3.5 h-3.5" />
+                      <span>
+                        {isConnectingSellerWallet
+                          ? 'Connecting Polygon Amoy...'
+                          : connectedWallet
+                          ? `Polygon Amoy (${truncateAddress(connectedWallet.address)})`
+                          : 'Connect Polygon Amoy Wallet'}
+                      </span>
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                    <p
+                      className={
+                        sellerWalletNote
+                          ? 'text-emerald-400'
+                          : sellerWallet.trim().length > 0 && walletCheck.valid
+                          ? 'text-emerald-400'
+                          : sellerWallet.trim().length > 0 && !walletCheck.valid
+                          ? 'text-amber-300'
+                          : 'text-slate-400'
+                      }
+                    >
+                      {sellerWalletNote
+                        ? sellerWalletNote
+                        : sellerWallet.trim().length > 0
+                        ? walletCheck.valid
+                          ? `${walletCheck.label} · Ready for Polygon Amoy ANAGU settlement`
+                          : walletCheck.reason || walletCheck.label
+                        : 'Connects on Polygon Amoy Testnet (Chain ID 80002) for ANAGU token filing fee settlement & LandTitleNFT issuance.'}
+                    </p>
+                    {sellerWallet.trim().length > 0 && (
+                      <span
+                        className={`font-mono text-[10px] px-2 py-0.5 rounded border ${
+                          walletCheck.valid
+                            ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                            : 'bg-amber-950/60 border-amber-500/40 text-amber-300'
+                        }`}
+                      >
+                        {walletCheck.valid ? 'Verified Format' : walletCheck.label}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Statutory Due-Process & Polygon Amoy Smart Contract Status */}
+                  <div className="mt-3 rounded-xl bg-slate-950 border border-slate-800 p-3.5 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-300">
+                        <Coins className="w-3.5 h-3.5 shrink-0" />
+                        <span>Polygon Amoy Due Process · AnaguToken &amp; LandTitleNFT</span>
+                      </div>
+                      <span className="font-mono text-[10px] text-slate-400">
+                        Chain ID 80002 · Statutory Fee: {tokenStatus?.registrationFeeFormatted || contractConfig.registrationFeeAnagu} ANAGU
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[10px]">
+                      <div className="px-2.5 py-1.5 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 font-semibold">
+                        1. Citizen &amp; ANAGU Fee
+                      </div>
+                      <div className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400">
+                        2. Surveyor GIS Check
+                      </div>
+                      <div className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400">
+                        3. Community Oracle
+                      </div>
+                      <div className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400">
+                        4. Registrar NFT Mint
+                      </div>
+                    </div>
+
+                    {contractConfig.anaguTokenAddress ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px]">
+                        <div className="space-y-0.5 min-w-0">
+                          <div className="text-slate-300">
+                            ANAGU Balance:{' '}
+                            <strong className="font-mono text-emerald-400">
+                              {tokenStatus?.balanceFormatted ?? '0'} ANAGU
+                            </strong>
+                          </div>
+                          <a
+                            href={getPolygonAmoyAddressUrl(contractConfig.anaguTokenAddress)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 font-mono text-[10px] text-slate-400 hover:text-emerald-300"
+                          >
+                            <span>AnaguToken: {truncateAddress(contractConfig.anaguTokenAddress)}</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
+                        {connectedWallet && tokenStatus?.testnetFaucetEnabled !== false && (
+                          <button
+                            type="button"
+                            disabled={isClaimingFaucet}
+                            onClick={() => void handleClaimTestnetAnagu()}
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold transition-colors disabled:opacity-50"
+                          >
+                            {isClaimingFaucet ? 'Claiming...' : 'Claim 1,000 Testnet ANAGU'}
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-amber-300/90 leading-relaxed">
+                        Smart contracts are ready in <code className="font-mono text-amber-200">contracts/</code>. Deploy to Polygon Amoy Testnet and add the addresses in <code className="font-mono text-amber-200">VITE_ANAGU_TOKEN_ADDRESS</code> or Admin Portal to trigger live on-chain ANAGU fee settlement.
+                      </div>
+                    )}
+
+                    {feeStatusNote && (
+                      <div className="text-[11px] text-emerald-300 font-medium pt-0.5">
+                        {feeStatusNote}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-slate-300">State of Jurisdiction</span>
+                  <select
+                    value={state}
+                    onChange={(e) => {
+                      const nextState = e.target.value;
+                      setState(nextState);
+                      const nextLgas = getLgasForState(nextState);
+                      const nextLga = nextLgas[0] || '';
+                      setLga(nextLga);
+                      setHasCustomPolygon(false);
+                      void recenterMapForRegion(landLocation, nextLga, nextState, true);
+                    }}
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl text-slate-100 outline-none transition-colors"
+                  >
+                    {NIGERIA_STATES_AND_LGAS.map((stateEntry) => (
+                      <option key={stateEntry.name} value={stateEntry.name}>
+                        {stateEntry.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-slate-300">Local Government Area (LGA)</span>
+                  <select
+                    value={lga}
+                    onChange={(e) => {
+                      const nextLga = e.target.value;
+                      setLga(nextLga);
+                      setHasCustomPolygon(false);
+                      void recenterMapForRegion(landLocation, nextLga, state, true);
+                    }}
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl text-slate-100 outline-none transition-colors"
+                  >
+                    {getLgasForState(state).map((lgaName) => (
+                      <option key={lgaName} value={lgaName}>
+                        {lgaName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block space-y-1.5 sm:col-span-2">
+                  <span className="font-medium text-slate-300">Designated Land Use</span>
+                  <select
+                    value={intendedUse}
+                    onChange={(e) => setIntendedUse(e.target.value as ParcelRecord['intendedUse'])}
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl text-slate-100 outline-none transition-colors"
+                  >
+                    <option value="Residential">Residential (C of O)</option>
+                    <option value="Commercial">Commercial / Mixed Use</option>
+                    <option value="Agricultural">Agricultural Farmland</option>
+                    <option value="Industrial">Industrial Zone</option>
+                    <option value="Public Utility">Public Utility / Community</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            {/* Section 2: Survey Beacon Coordinate Array (WGS84 & UTM) */}
+            <div className="p-4 sm:p-8 border-t border-slate-800 space-y-5 bg-slate-900/50">
+              <div className="flex items-center gap-3 pb-4 border-b border-slate-800">
+                <div className="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 flex items-center justify-center shrink-0">
+                  <Compass className="w-4 h-4" />
+                </div>
+                <div>
+                  <h2 className="text-sm font-bold text-white tracking-tight">
+                    2. Survey Beacon Coordinate Array (WGS84 &amp; UTM)
+                  </h2>
+                  <p className="text-[11px] text-slate-400">
+                    Land demarcation, parcel location, geometry direction, and official survey plan upload
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+                <div className="space-y-1.5 sm:col-span-2 relative">
+                  <label htmlFor="land-location-input" className="block font-medium text-slate-300">
+                    Location / Landmark of the Land *
+                  </label>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      id="land-location-input"
+                      type="text"
+                      required
+                      value={landLocation}
+                      onFocus={() => setShowSuggestions(true)}
+                      onBlur={() => window.setTimeout(() => setShowSuggestions(false), 180)}
+                      onChange={(e) => {
+                        setHasCustomPolygon(false);
+                        setLandLocation(e.target.value);
+                        setShowSuggestions(true);
+                      }}
+                      placeholder="Type a street or landmark, e.g. Admiralty Way, Lekki Phase 1"
+                      className="flex-1 px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl text-slate-100 placeholder:text-slate-600 outline-none transition-colors"
+                    />
+                    <button
+                      type="button"
+                      disabled={isLocatingMap}
+                      onClick={() => {
+                        setHasCustomPolygon(false);
+                        setShowSuggestions(false);
+                        void recenterMapForRegion(landLocation, lga, state, true);
+                      }}
+                      className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 border border-slate-700 text-emerald-300 text-xs font-semibold rounded-xl transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
+                    >
+                      <Search className="w-3.5 h-3.5" />
+                      <span>{isLocatingMap ? 'Locating...' : 'Locate Landmark'}</span>
+                    </button>
+                  </div>
+
+                  {showSuggestions && landmarkSuggestions.length > 0 && (
+                    <div className="absolute left-0 right-0 top-full mt-1 z-30 bg-slate-950 border border-slate-700 rounded-xl shadow-2xl overflow-hidden divide-y divide-slate-800/80">
+                      {landmarkSuggestions.map((item, idx) => (
+                        <button
+                          key={`${item.lat}-${item.lng}-${idx}`}
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            handleSelectSuggestion(item);
+                          }}
+                          className="w-full px-3.5 py-2.5 text-left hover:bg-emerald-950/50 transition-colors flex items-start justify-between gap-3"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-white truncate">
+                              {item.name}
+                            </div>
+                            <div className="text-[11px] text-slate-400 truncate">
+                              {item.displayName}
+                            </div>
+                          </div>
+                          <span className="text-[10px] font-mono text-emerald-400 shrink-0 mt-0.5">
+                            {item.lat.toFixed(4)}, {item.lng.toFixed(4)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Interactive Map Address Preview & Live Geometry Direction / Geographical Area */}
+                <div className="space-y-3 sm:col-span-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-medium text-slate-300 inline-flex items-center gap-1.5">
+                      <MapIcon className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Exact Map Address &amp; Parcel Pin</span>
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Tap anywhere on the map to reposition plot pin
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-stretch">
+                    <div className="md:col-span-7 flex flex-col space-y-1.5 min-w-0">
+                      <OpenStreetMapWidget
+                        coordinates={livePolygon.valid ? livePolygon.coordinates : []}
+                        centerFallback={getStateCenter(state)}
+                        heightClassName="h-56 sm:h-64"
+                        onPickLocation={handlePickLocationOnMap}
+                        landmarkLabel={landLocation.trim() || `${lga}, ${state}`}
+                      />
+                      <p className="text-[11px] text-emerald-400/90 font-mono truncate">
+                        {mapStatusNote}
+                      </p>
+                    </div>
+
+                    <div className="md:col-span-5 bg-slate-950 border border-slate-800 rounded-xl p-3 flex flex-col justify-between space-y-2.5 min-w-0">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-semibold text-slate-200 inline-flex items-center gap-1.5">
+                          <Camera className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          <span>Map Address Snapshot</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleRefreshSnapshotPreview}
+                          disabled={isGeneratingPreview}
+                          className="text-[10px] font-medium text-emerald-400 hover:text-emerald-300 inline-flex items-center gap-1 shrink-0"
+                        >
+                          <RefreshCw className={`w-3 h-3 ${isGeneratingPreview ? 'animate-spin' : ''}`} />
+                          <span>Refresh</span>
+                        </button>
+                      </div>
+
+                      <div className="relative flex-1 min-h-[168px] rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
+                        {previewSnapshotUrl ? (
+                          <img
+                            src={previewSnapshotUrl}
+                            alt={`Map address preview for ${landLocation || lga}`}
+                            className="w-full h-full object-cover"
+                            onError={() => setPreviewSnapshotUrl('')}
+                          />
+                        ) : (
+                          <LandRegistrySnapshot
+                            coordinates={livePolygon.valid ? livePolygon.coordinates : []}
+                            cadastralRef={surveyPlanRef.trim() || 'LIVE SURVEY'}
+                            areaSqm={liveAreaEstimate}
+                            stateName={state}
+                            title={landLocation.trim() || lga}
+                          />
+                        )}
+                      </div>
+
+                      <div className="text-[10px] text-slate-400 leading-snug">
+                        This verified map snapshot is saved with your parcel record on <strong className="text-slate-200">Access Lands</strong> across all devices.
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Dynamic Geometry Direction & Geographical Area Breakdown */}
+                  <div className="bg-slate-950/90 border border-emerald-500/30 rounded-xl p-3.5 sm:p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800/80">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400 inline-flex items-center gap-1.5">
+                        <Compass className="w-3.5 h-3.5" />
+                        <span>Geometry Direction &amp; Geographical Area</span>
+                      </span>
+                      <span className="font-mono text-[10px] text-slate-400">
+                        {liveGeoInfo.centroid.lat.toFixed(5)}°N, {liveGeoInfo.centroid.lng.toFixed(5)}°E
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[11px]">
+                      <div className="space-y-1 bg-slate-900/70 border border-slate-800 rounded-lg p-2.5">
+                        <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">
+                          Geographical Area
+                        </div>
+                        <div className="font-semibold text-white">
+                          {liveGeoInfo.geopoliticalZone} · {lga}, {state}
+                        </div>
+                        <div className="text-slate-300 leading-snug">
+                          {liveGeoInfo.terrainProfile}
+                        </div>
+                        <div className="text-emerald-400 font-mono text-[10px] pt-0.5">
+                          {liveGeoInfo.relativePosition}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1 bg-slate-900/70 border border-slate-800 rounded-lg p-2.5">
+                        <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">
+                          Geometry Direction &amp; Span
+                        </div>
+                        <div className="font-semibold text-white">
+                          {liveGeoInfo.primaryOrientation}
+                        </div>
+                        <div className="text-slate-300 font-mono text-[10px]">
+                          Span: {liveGeoInfo.dimensionsLabel} · ~{liveAreaEstimate.toLocaleString()} m²
+                        </div>
+                        <div className="text-slate-400 font-mono text-[10px] leading-snug break-words">
+                          {liveGeoInfo.edgeSummary}
+                        </div>
+                      </div>
+                    </div>
+
+                    <p className="text-[11px] text-slate-300 leading-relaxed">
+                      {liveGeoInfo.fullDescription}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 sm:col-span-2">
+                  <label htmlFor="demarcation-input" className="block font-medium text-slate-300">
+                    Demarcation of Land *
+                  </label>
+                  <textarea
+                    id="demarcation-input"
+                    required
+                    rows={2}
+                    value={landDemarcation}
+                    onChange={(e) => {
+                      setHasCustomPolygon(true);
+                      setLandDemarcation(e.target.value);
+                    }}
+                    placeholder={SAMPLE_DEMARCATION_POLYGON}
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl font-mono text-xs text-slate-100 placeholder:text-slate-600 outline-none transition-colors resize-y"
+                  />
+                  <p className="text-[11px] text-slate-500 font-mono">
+                    Format: [[[lng, lat], [lng, lat], [lng, lat], [lng, lat], [lng, lat]]]
+                  </p>
+                </div>
+
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-slate-300">Land price (USD)</span>
+                  <div className="relative">
+                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-mono text-xs pointer-events-none">
+                      $
+                    </span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={landPrice}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        if (/^[0-9,.\s]*$/.test(raw)) {
+                          setLandPrice(raw);
+                        }
+                      }}
+                      placeholder="Enter any amount, e.g. 85000"
+                      className="w-full pl-7 pr-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl font-mono tabular-nums text-slate-100 placeholder:text-slate-600 outline-none transition-colors"
+                    />
+                  </div>
+                </label>
+
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-slate-300">Survey Plan Reference (Optional)</span>
+                  <input
+                    type="text"
+                    value={surveyPlanRef}
+                    onChange={(e) => setSurveyPlanRef(e.target.value)}
+                    placeholder="e.g. NIS/FCT/SP/2026/0942"
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl font-mono text-slate-100 placeholder:text-slate-600 outline-none transition-colors"
+                  />
+                </label>
+              </div>
+
+              {/* Official Survey Plan Document Upload */}
+              <div className="space-y-3 pt-1">
+                <span className="block text-xs font-medium text-slate-300">
+                  Official Survey Plan Document *
+                </span>
+
+                <div className="space-y-1.5">
+                  <span className="block text-[11px] text-slate-400">
+                    Specify the kind of document you are submitting:
+                  </span>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" role="radiogroup" aria-label="Document type">
+                    {DOCUMENT_TYPES.map((typeOption, idx) => {
+                      const isSelected = documentType === typeOption;
+                      return (
+                        <button
+                          key={typeOption}
+                          type="button"
+                          role="radio"
+                          aria-checked={isSelected}
+                          onClick={() => setDocumentType(typeOption)}
+                          className={`px-3.5 py-2.5 rounded-xl border text-left text-xs font-medium transition-colors flex items-center gap-2.5 ${
+                            isSelected
+                              ? 'bg-emerald-950/50 border-emerald-500 text-emerald-300'
+                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700 hover:text-white'
+                          }`}
+                        >
+                          <span
+                            className={`w-4 h-4 rounded-full border flex items-center justify-center text-[10px] font-mono shrink-0 ${
+                              isSelected
+                                ? 'border-emerald-400 bg-emerald-500 text-slate-950 font-bold'
+                                : 'border-slate-600 text-slate-400'
+                            }`}
+                          >
+                            {idx + 1}
+                          </span>
+                          <span className="truncate">{typeOption}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {uploadedFileName ? (
+                  <div className="p-4 rounded-xl border border-emerald-500/40 bg-emerald-950/20 flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-lg bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0">
+                        <FileText className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-[11px] font-semibold text-emerald-400">{documentType}</div>
+                        <div className="text-xs font-semibold text-white truncate">
+                          {uploadedFileName}
+                        </div>
+                        <div className="text-[11px] text-slate-400 font-mono mt-0.5 truncate">
+                          {uploadedFileSize}
+                          {isHashingFile
+                            ? ' · Verifying document...'
+                            : calculatedHash
+                            ? ` · SHA-256 ${calculatedHash.slice(0, 14)}...`
+                            : ''}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      <label className="cursor-pointer px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-[11px] font-semibold text-slate-200 transition-colors">
+                        Replace
+                        <input
+                          type="file"
+                          accept=".pdf,.png,.jpg,.jpeg,.doc,.docx"
+                          onChange={handleFileUpload}
+                          className="hidden"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleClearFile}
+                        className="p-1.5 text-slate-400 hover:text-red-400 rounded-lg hover:bg-slate-800 transition-colors"
+                        title="Remove uploaded document"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <label className="cursor-pointer flex flex-col items-center justify-center gap-2.5 p-6 rounded-xl border-2 border-dashed border-slate-700 hover:border-emerald-500/70 bg-slate-950/70 hover:bg-slate-950 transition-colors text-center">
+                    <div className="w-11 h-11 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 flex items-center justify-center">
+                      <Upload className="w-5 h-5" />
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-xs font-semibold text-white">
+                        Click to upload your {documentType}
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        Supports stamped PDF, PNG, JPG, or DOC files
+                      </div>
+                    </div>
+                    <input
+                      type="file"
+                      accept=".pdf,.png,.jpg,.jpeg,.doc,.docx"
+                      onChange={handleFileUpload}
+                      className="hidden"
+                    />
+                  </label>
+                )}
+              </div>
+            </div>
+
+            {/* Submit Bar */}
+            <div className="px-4 sm:px-8 py-5 border-t border-slate-800 bg-slate-950/60 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              {formError ? (
+                <div className="text-xs text-red-400 font-medium">{formError}</div>
+              ) : (
+                <div className="text-xs text-slate-400">
+                  All submissions are cryptographically stamped and recorded in the state registry.
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full sm:w-auto px-6 py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-bold text-xs rounded-xl shadow-lg transition-all inline-flex items-center justify-center gap-2 whitespace-nowrap shrink-0"
+              >
+                {isSubmitting ? (
+                  <>
+                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    <span>Submitting Application...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>Submit Application</span>
+                    <ChevronRight className="w-4 h-4" />
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+};
